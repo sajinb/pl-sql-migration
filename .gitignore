@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+output/
+.env
+.migration_checkpoints.db
+.idea/
+.vscode/
