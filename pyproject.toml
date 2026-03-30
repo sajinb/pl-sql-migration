@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "tsql-migration"
+version = "0.1.0"
+description = "AI-powered T-SQL to Spring Boot 3 / Java 21 migration tool"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlglot>=26.0.0",
+    "langgraph>=0.4.0",
+    "langchain>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-text-splitters>=0.3.0",
+    "neo4j>=5.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+db = [
+    "pyodbc>=5.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+tsql-migrate = "tsql_migration.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,36 @@
+migration:
+  sql_input_dir: "sql-input/procedures"
+  ddl_input_dir: "sql-input/ddl"
+  output_dir: "output"
+
+  # LLM
+  llm_provider: "anthropic"
+  llm_model: "claude-sonnet-4-6"
+  llm_api_key_env: "ANTHROPIC_API_KEY"
+
+  # Chunking
+  large_procedure_threshold: 2000
+  chunk_size_tokens: 8000
+  chunk_overlap_tokens: 500
+
+  # Neo4j
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password_env: "NEO4J_PASSWORD"
+
+  # Source SQL Server (optional)
+  source_db:
+    enabled: false
+    connection_string_env: "SOURCE_DB_CONNECTION_STRING"
+
+  # Staging tables
+  staging_table_prefix: "stg_"
+
+  # Output
+  base_package: "com.migration.generated"
+  use_jdbc_template: false
+  generate_tests: true
+
+  # LangGraph
+  checkpointer: "sqlite"
+  checkpoint_db: ".migration_checkpoints.db"
