@@ -1,13 +1,24 @@
 """Neo4j client for storing and querying the procedure call graph.
 
+Supports two isolation strategies to avoid corrupting existing Neo4j data:
+
+1. **Dedicated database** (Enterprise/Aura): Set `neo4j_database` in config.
+   All queries run against that database only.
+
+2. **Namespaced labels** (Community Edition): Set `neo4j_label_prefix` in config.
+   All node labels are prefixed (e.g. `Mig_Procedure` instead of `Procedure`).
+   Only prefixed nodes are touched by clear_graph.
+
 Data model:
-  Core nodes:   Procedure, Table, TempTable
-  Edge nodes:   LinkedServer, DynamicCall, DispatchTable, UnresolvedCall
+  Core nodes:   {prefix}Procedure, {prefix}Table, {prefix}TempTable
+  Edge nodes:   {prefix}LinkedServer, {prefix}DynamicCall, {prefix}DispatchTable, {prefix}UnresolvedCall
   Relationships: CALLS, USES_TABLE, USES_TEMP_TABLE, CALLS_REMOTE,
                  READS_REMOTE, USES_DYNAMIC_SQL, DYNAMIC_DISPATCH, UNRESOLVED_CALL
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 from neo4j import GraphDatabase, Driver
 
@@ -18,32 +29,65 @@ from tsql_migration.state import (
 
 
 class Neo4jClient:
-    """Manages the procedure call graph in Neo4j."""
+    """Manages the procedure call graph in Neo4j with database/label isolation."""
 
-    def __init__(self, uri: str, user: str, password: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        database: str = "",
+        label_prefix: str = "Mig_",
+    ) -> None:
         self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password))
+        self._database: Optional[str] = database or None
+        self._prefix = label_prefix
+
+        # Prefixed label names
+        self.L_PROCEDURE = f"{self._prefix}Procedure"
+        self.L_TABLE = f"{self._prefix}Table"
+        self.L_TEMP_TABLE = f"{self._prefix}TempTable"
+        self.L_LINKED_SERVER = f"{self._prefix}LinkedServer"
+        self.L_DYNAMIC_CALL = f"{self._prefix}DynamicCall"
+        self.L_DISPATCH_TABLE = f"{self._prefix}DispatchTable"
+        self.L_UNRESOLVED_CALL = f"{self._prefix}UnresolvedCall"
 
     def close(self) -> None:
         self._driver.close()
+
+    def _run(self, query: str, **params):
+        """Execute a Cypher query against the configured database."""
+        return self._driver.execute_query(query, parameters_=params, database_=self._database)
 
     # -------------------------------------------------------------------
     # Setup
     # -------------------------------------------------------------------
 
     def clear_graph(self) -> None:
-        """Delete all nodes and relationships (use at start of new analysis)."""
-        self._driver.execute_query("MATCH (n) DETACH DELETE n")
+        """Delete only migration-related nodes (identified by label prefix).
+
+        This is safe to run even when the Neo4j instance has other data —
+        only nodes with the configured label prefix are deleted.
+        """
+        self._run(
+            f"""
+            MATCH (n)
+            WHERE any(label IN labels(n) WHERE label STARTS WITH $prefix)
+            DETACH DELETE n
+            """,
+            prefix=self._prefix,
+        )
 
     def create_constraints(self) -> None:
         """Create uniqueness constraints for core node types."""
         constraints = [
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Procedure) REQUIRE p.name IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.name IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (tt:TempTable) REQUIRE tt.name IS UNIQUE",
+            f"CREATE CONSTRAINT IF NOT EXISTS FOR (p:{self.L_PROCEDURE}) REQUIRE p.name IS UNIQUE",
+            f"CREATE CONSTRAINT IF NOT EXISTS FOR (t:{self.L_TABLE}) REQUIRE t.name IS UNIQUE",
+            f"CREATE CONSTRAINT IF NOT EXISTS FOR (tt:{self.L_TEMP_TABLE}) REQUIRE tt.name IS UNIQUE",
         ]
         for cypher in constraints:
             try:
-                self._driver.execute_query(cypher)
+                self._run(cypher)
             except Exception:
                 pass  # constraint may already exist
 
@@ -53,10 +97,13 @@ class Neo4jClient:
 
     def add_procedure(self, proc: ProcedureMetadata) -> None:
         """Add a procedure node with its table/temp table relationships."""
-        # Create or merge Procedure node
-        self._driver.execute_query(
-            """
-            MERGE (p:Procedure {name: $name})
+        LP = self.L_PROCEDURE
+        LT = self.L_TABLE
+        LTT = self.L_TEMP_TABLE
+
+        self._run(
+            f"""
+            MERGE (p:{LP} {{name: $name}})
             SET p.schema = $schema,
                 p.lineCount = $lineCount,
                 p.paramCount = $paramCount,
@@ -69,28 +116,26 @@ class Neo4jClient:
             sourceFile=proc.source_file,
         )
 
-        # Referenced tables
         for table in proc.referenced_tables:
-            self._driver.execute_query(
-                """
-                MERGE (t:Table {name: $table})
+            self._run(
+                f"""
+                MERGE (t:{LT} {{name: $table}})
                 WITH t
-                MERGE (p:Procedure {name: $proc})
+                MERGE (p:{LP} {{name: $proc}})
                 MERGE (p)-[:USES_TABLE]->(t)
                 """,
                 table=table,
                 proc=proc.procedure_name,
             )
 
-        # Temp tables
         for temp in proc.temp_tables:
-            self._driver.execute_query(
-                """
-                MERGE (tt:TempTable {name: $name})
+            self._run(
+                f"""
+                MERGE (tt:{LTT} {{name: $name}})
                 SET tt.stagingName = $stagingName,
                     tt.isGlobal = $isGlobal
                 WITH tt
-                MERGE (p:Procedure {name: $proc})
+                MERGE (p:{LP} {{name: $proc}})
                 MERGE (p)-[:USES_TEMP_TABLE]->(tt)
                 """,
                 name=temp.original_name,
@@ -99,14 +144,13 @@ class Neo4jClient:
                 proc=proc.procedure_name,
             )
 
-        # Called procedures
         for called in proc.called_procedures:
-            self._driver.execute_query(
-                """
-                MERGE (callee:Procedure {name: $callee})
+            self._run(
+                f"""
+                MERGE (callee:{LP} {{name: $callee}})
                 WITH callee
-                MERGE (caller:Procedure {name: $caller})
-                MERGE (caller)-[:CALLS {certainty: "resolved"}]->(callee)
+                MERGE (caller:{LP} {{name: $caller}})
+                MERGE (caller)-[:CALLS {{certainty: "resolved"}}]->(callee)
                 """,
                 callee=called,
                 caller=proc.procedure_name,
@@ -114,19 +158,24 @@ class Neo4jClient:
 
     def add_edge_cases(self, report: EdgeCaseReport) -> None:
         """Add edge case nodes and relationships to the graph."""
-        # Linked servers
+        LP = self.L_PROCEDURE
+        LLS = self.L_LINKED_SERVER
+        LDC = self.L_DYNAMIC_CALL
+        LDT = self.L_DISPATCH_TABLE
+        LUC = self.L_UNRESOLVED_CALL
+
         for ref in report.linked_servers:
-            self._driver.execute_query(
-                """
-                MERGE (ls:LinkedServer {name: $server})
+            self._run(
+                f"""
+                MERGE (ls:{LLS} {{name: $server}})
                 SET ls.database = $database
                 WITH ls
-                MERGE (p:Procedure {name: $proc})
-                MERGE (p)-[:CALLS_REMOTE {
+                MERGE (p:{LP} {{name: $proc}})
+                MERGE (p)-[:CALLS_REMOTE {{
                     operation: $operation,
                     remoteObject: $remoteObject,
                     line: $line
-                }]->(ls)
+                }}]->(ls)
                 """,
                 server=ref.server,
                 database=ref.database,
@@ -136,18 +185,17 @@ class Neo4jClient:
                 line=ref.line,
             )
 
-        # Dynamic SQL
         for ref in report.dynamic_sql_calls:
-            self._driver.execute_query(
-                """
-                CREATE (dc:DynamicCall {
+            self._run(
+                f"""
+                CREATE (dc:{LDC} {{
                     expression: $expression,
                     tier: $tier,
                     line: $line,
                     resolvedSql: $resolvedSql
-                })
+                }})
                 WITH dc
-                MERGE (p:Procedure {name: $proc})
+                MERGE (p:{LP} {{name: $proc}})
                 MERGE (p)-[:USES_DYNAMIC_SQL]->(dc)
                 """,
                 expression=ref.expression,
@@ -157,21 +205,19 @@ class Neo4jClient:
                 proc=ref.procedure,
             )
 
-        # Variable calls
         for ref in report.variable_calls:
             if ref.certainty == "resolved" and ref.resolved_targets:
-                # Add a CALLS edge with type=variable
                 for target in ref.resolved_targets:
-                    self._driver.execute_query(
-                        """
-                        MERGE (callee:Procedure {name: $callee})
+                    self._run(
+                        f"""
+                        MERGE (callee:{LP} {{name: $callee}})
                         WITH callee
-                        MERGE (caller:Procedure {name: $caller})
-                        MERGE (caller)-[:CALLS {
+                        MERGE (caller:{LP} {{name: $caller}})
+                        MERGE (caller)-[:CALLS {{
                             type: "variable",
                             certainty: "resolved",
                             variable: $variable
-                        }]->(callee)
+                        }}]->(callee)
                         """,
                         callee=target,
                         caller=ref.procedure,
@@ -179,17 +225,17 @@ class Neo4jClient:
                     )
             elif ref.certainty == "conditional" and ref.resolved_targets:
                 for target in ref.resolved_targets:
-                    self._driver.execute_query(
-                        """
-                        MERGE (callee:Procedure {name: $callee})
+                    self._run(
+                        f"""
+                        MERGE (callee:{LP} {{name: $callee}})
                         WITH callee
-                        MERGE (caller:Procedure {name: $caller})
-                        MERGE (caller)-[:CALLS {
+                        MERGE (caller:{LP} {{name: $caller}})
+                        MERGE (caller)-[:CALLS {{
                             type: "variable",
                             certainty: "conditional",
                             variable: $variable,
                             condition: $condition
-                        }]->(callee)
+                        }}]->(callee)
                         """,
                         callee=target,
                         caller=ref.procedure,
@@ -197,15 +243,15 @@ class Neo4jClient:
                         condition=ref.condition or "",
                     )
             elif ref.certainty == "dispatch_table":
-                self._driver.execute_query(
-                    """
-                    CREATE (dt:DispatchTable {
+                self._run(
+                    f"""
+                    CREATE (dt:{LDT} {{
                         name: $tableRef,
                         variable: $variable,
                         line: $line
-                    })
+                    }})
                     WITH dt
-                    MERGE (p:Procedure {name: $proc})
+                    MERGE (p:{LP} {{name: $proc}})
                     MERGE (p)-[:DYNAMIC_DISPATCH]->(dt)
                     """,
                     tableRef=ref.condition or "unknown",
@@ -214,16 +260,15 @@ class Neo4jClient:
                     proc=ref.procedure,
                 )
             else:
-                # Opaque
-                self._driver.execute_query(
-                    """
-                    CREATE (uc:UnresolvedCall {
+                self._run(
+                    f"""
+                    CREATE (uc:{LUC} {{
                         variable: $variable,
                         line: $line,
                         context: $context
-                    })
+                    }})
                     WITH uc
-                    MERGE (p:Procedure {name: $proc})
+                    MERGE (p:{LP} {{name: $proc}})
                     MERGE (p)-[:UNRESOLVED_CALL]->(uc)
                     """,
                     variable=ref.variable,
@@ -238,9 +283,10 @@ class Neo4jClient:
 
     def get_leaf_procedures(self) -> list[str]:
         """Find procedures that don't call any other procedure."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (p:Procedure)
+        LP = self.L_PROCEDURE
+        records, _, _ = self._run(
+            f"""
+            MATCH (p:{LP})
             WHERE NOT (p)-[:CALLS]->()
             RETURN p.name AS name
             ORDER BY p.name
@@ -249,24 +295,21 @@ class Neo4jClient:
         return [r["name"] for r in records]
 
     def get_migration_order(self) -> list[str]:
-        """Topological sort — leaf procedures first, then their callers.
+        """Topological sort — leaf procedures first, then their callers."""
+        LP = self.L_PROCEDURE
 
-        Uses a simple BFS-based approach since GDS may not be installed.
-        """
-        # Get all procedures and their outgoing call counts
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (p:Procedure)
-            OPTIONAL MATCH (p)-[:CALLS]->(callee:Procedure)
+        records, _, _ = self._run(
+            f"""
+            MATCH (p:{LP})
+            OPTIONAL MATCH (p)-[:CALLS]->(callee:{LP})
             RETURN p.name AS name, count(callee) AS outDegree
             """
         )
         out_degree: dict[str, int] = {r["name"]: r["outDegree"] for r in records}
 
-        # Get reverse edges (who calls whom)
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (caller:Procedure)-[:CALLS]->(callee:Procedure)
+        records, _, _ = self._run(
+            f"""
+            MATCH (caller:{LP})-[:CALLS]->(callee:{LP})
             RETURN caller.name AS caller, callee.name AS callee
             """
         )
@@ -274,7 +317,6 @@ class Neo4jClient:
         for r in records:
             reverse_adj.setdefault(r["callee"], []).append(r["caller"])
 
-        # Kahn's algorithm — start with nodes that have 0 outgoing calls
         from collections import deque
 
         queue: deque[str] = deque()
@@ -300,14 +342,14 @@ class Neo4jClient:
 
     def detect_cycles(self) -> list[list[str]]:
         """Detect circular call dependencies."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH path = (p:Procedure)-[:CALLS*]->(p)
+        LP = self.L_PROCEDURE
+        records, _, _ = self._run(
+            f"""
+            MATCH path = (p:{LP})-[:CALLS*]->(p)
             RETURN [n IN nodes(path) | n.name] AS cycle
             LIMIT 20
             """
         )
-        # Deduplicate cycles
         seen: set[str] = set()
         cycles: list[list[str]] = []
         for r in records:
@@ -319,9 +361,10 @@ class Neo4jClient:
 
     def get_external_dependencies(self) -> list[str]:
         """Find procedures that are called but have no source (no lineCount)."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (p:Procedure)
+        LP = self.L_PROCEDURE
+        records, _, _ = self._run(
+            f"""
+            MATCH (p:{LP})
             WHERE p.lineCount IS NULL OR p.lineCount = 0
             RETURN p.name AS name
             ORDER BY p.name
@@ -331,9 +374,11 @@ class Neo4jClient:
 
     def get_linked_server_report(self) -> list[dict]:
         """Get all linked server references."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (p:Procedure)-[r:CALLS_REMOTE|READS_REMOTE]->(ls:LinkedServer)
+        LP = self.L_PROCEDURE
+        LLS = self.L_LINKED_SERVER
+        records, _, _ = self._run(
+            f"""
+            MATCH (p:{LP})-[r:CALLS_REMOTE|READS_REMOTE]->(ls:{LLS})
             RETURN p.name AS procedure, ls.name AS server,
                    ls.database AS database, r.operation AS operation,
                    r.remoteObject AS remoteObject, r.line AS line
@@ -344,9 +389,10 @@ class Neo4jClient:
 
     def get_unresolved_calls_report(self) -> list[dict]:
         """Get all unresolved/dynamic calls."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (p:Procedure)-[r:UNRESOLVED_CALL|DYNAMIC_DISPATCH|USES_DYNAMIC_SQL]->(target)
+        LP = self.L_PROCEDURE
+        records, _, _ = self._run(
+            f"""
+            MATCH (p:{LP})-[r:UNRESOLVED_CALL|DYNAMIC_DISPATCH|USES_DYNAMIC_SQL]->(target)
             RETURN p.name AS procedure, labels(target)[0] AS targetType,
                    properties(target) AS details, type(r) AS relType
             ORDER BY p.name
@@ -356,9 +402,11 @@ class Neo4jClient:
 
     def get_all_referenced_tables(self) -> list[str]:
         """Get all unique table names referenced by any procedure."""
-        records, _, _ = self._driver.execute_query(
-            """
-            MATCH (:Procedure)-[:USES_TABLE]->(t:Table)
+        LP = self.L_PROCEDURE
+        LT = self.L_TABLE
+        records, _, _ = self._run(
+            f"""
+            MATCH (:{LP})-[:USES_TABLE]->(t:{LT})
             RETURN DISTINCT t.name AS name
             ORDER BY t.name
             """

@@ -14,7 +14,13 @@ def analyze_node(state: MigrationState) -> dict:
     config = state.config
 
     neo4j_password = os.environ.get(config.neo4j_password_env, "neo4j")
-    client = Neo4jClient(config.neo4j_uri, config.neo4j_user, neo4j_password)
+    client = Neo4jClient(
+        config.neo4j_uri,
+        config.neo4j_user,
+        neo4j_password,
+        database=config.neo4j_database,
+        label_prefix=config.neo4j_label_prefix,
+    )
 
     try:
         # Clear and set up

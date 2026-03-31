@@ -30,6 +30,8 @@ class MigrationConfig(BaseModel):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password_env: str = "NEO4J_PASSWORD"
+    neo4j_database: str = ""  # dedicated database name (Enterprise/Aura); leave empty for Community
+    neo4j_label_prefix: str = "Mig_"  # prefix for all node labels to avoid collisions with existing data
 
     # Source SQL Server
     source_db: SourceDbConfig = Field(default_factory=SourceDbConfig)

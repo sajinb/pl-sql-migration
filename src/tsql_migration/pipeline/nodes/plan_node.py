@@ -12,7 +12,13 @@ def plan_node(state: MigrationState) -> dict:
     """Query Neo4j for the topological migration order."""
     config = state.config
     neo4j_password = os.environ.get(config.neo4j_password_env, "neo4j")
-    client = Neo4jClient(config.neo4j_uri, config.neo4j_user, neo4j_password)
+    client = Neo4jClient(
+        config.neo4j_uri,
+        config.neo4j_user,
+        neo4j_password,
+        database=config.neo4j_database,
+        label_prefix=config.neo4j_label_prefix,
+    )
 
     try:
         migration_order = client.get_migration_order()

@@ -143,10 +143,35 @@ migration:
   llm_provider: "anthropic"       # or "openai"
   llm_model: "claude-sonnet-4-6"  # or "gpt-4o"
   neo4j_uri: "bolt://localhost:7687"
+  neo4j_database: ""              # dedicated DB (Enterprise/Aura); empty for Community
+  neo4j_label_prefix: "Mig_"     # prefix all node labels to avoid collisions
   large_procedure_threshold: 2000
   staging_table_prefix: "stg_"
   base_package: "com.migration.generated"
 ```
+
+#### Neo4j Database Isolation
+
+If your Neo4j instance is shared with other applications, you have two options:
+
+**Option A: Dedicated database (Enterprise/Aura)**
+```yaml
+neo4j_database: "tsql_migration"   # all queries scoped to this database
+neo4j_label_prefix: ""             # no prefix needed with a dedicated DB
+```
+Create the database and user first:
+```cypher
+CREATE DATABASE tsql_migration;
+CREATE USER tsql_migrator SET PASSWORD 'secure-password';
+GRANT ALL ON DATABASE tsql_migration TO tsql_migrator;
+```
+
+**Option B: Namespaced labels (Community Edition — default)**
+```yaml
+neo4j_database: ""                 # uses the default database
+neo4j_label_prefix: "Mig_"        # all labels prefixed: Mig_Procedure, Mig_Table, etc.
+```
+Only nodes with the `Mig_` prefix are created or deleted. Existing data is untouched.
 
 Set environment variables:
 ```bash
