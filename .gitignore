@@ -8,3 +8,6 @@ output/
 .migration_checkpoints.db
 .idea/
 .vscode/
+node_modules/
+frontend/dist/
+projects/
