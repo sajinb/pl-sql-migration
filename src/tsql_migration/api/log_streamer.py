@@ -6,10 +6,8 @@ import asyncio
 import io
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-
-from fastapi import WebSocket
 
 
 @dataclass
@@ -53,27 +51,38 @@ class LogBroadcaster:
                 self._loop.call_soon_threadsafe(queue.put_nowait, None)
 
 
-# Per-project broadcasters
+# Per-run broadcasters (keyed by run_id, not project_id)
 _broadcasters: dict[int, LogBroadcaster] = {}
 
 
-def get_broadcaster(project_id: int) -> LogBroadcaster:
-    if project_id not in _broadcasters:
-        _broadcasters[project_id] = LogBroadcaster()
-    return _broadcasters[project_id]
+def get_broadcaster(run_id: int) -> LogBroadcaster:
+    if run_id not in _broadcasters:
+        _broadcasters[run_id] = LogBroadcaster()
+    return _broadcasters[run_id]
 
 
-def remove_broadcaster(project_id: int) -> None:
-    _broadcasters.pop(project_id, None)
+def remove_broadcaster(run_id: int) -> None:
+    _broadcasters.pop(run_id, None)
 
 
 class _CapturingWriter:
-    """Wraps sys.stdout to intercept print() calls from pipeline nodes."""
+    """Wraps sys.stdout to intercept print() calls from pipeline nodes.
 
-    def __init__(self, original: io.TextIOBase, broadcaster: LogBroadcaster, stage_holder: list):
+    Emits to WebSocket AND persists to migration_logs via an async helper
+    running on a separate event loop in the pipeline thread.
+    """
+
+    def __init__(
+        self,
+        original: io.TextIOBase,
+        broadcaster: LogBroadcaster,
+        stage_holder: list,
+        run_id: int,
+    ):
         self._original = original
         self._broadcaster = broadcaster
-        self._stage_holder = stage_holder  # mutable list holding current stage name
+        self._stage_holder = stage_holder
+        self._run_id = run_id
 
     def write(self, text: str) -> int:
         self._original.write(text)
@@ -86,21 +95,47 @@ class _CapturingWriter:
             elif "WARNING" in stripped or "SKIP" in stripped:
                 level = "warning"
             self._broadcaster.emit(LogEntry(stage=stage, message=stripped, level=level))
+            # Persist to DB (fire-and-forget from sync context)
+            _persist_log_sync(self._run_id, stage, level, stripped)
         return len(text)
 
     def flush(self) -> None:
         self._original.flush()
 
-    # Forward other attributes to the original
     def __getattr__(self, name):
         return getattr(self._original, name)
 
 
+def _persist_log_sync(run_id: int, stage: str, level: str, message: str) -> None:
+    """Persist a log entry from a synchronous (thread) context."""
+    import asyncio
+    from tsql_migration.api.database import async_session
+    from tsql_migration.api.models import LogLevel, MigrationLog
+
+    async def _insert():
+        async with async_session() as db:
+            db.add(MigrationLog(
+                run_id=run_id,
+                stage=stage,
+                level=LogLevel(level),
+                message=message,
+            ))
+            await db.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_insert())
+    except Exception:
+        pass  # Don't let log persistence failures break the pipeline
+    finally:
+        loop.close()
+
+
 @contextmanager
-def capture_stdout(broadcaster: LogBroadcaster, stage_holder: list):
+def capture_stdout(broadcaster: LogBroadcaster, stage_holder: list, run_id: int):
     """Context manager that redirects stdout through the broadcaster."""
     original = sys.stdout
-    sys.stdout = _CapturingWriter(original, broadcaster, stage_holder)
+    sys.stdout = _CapturingWriter(original, broadcaster, stage_holder, run_id)
     try:
         yield
     finally:

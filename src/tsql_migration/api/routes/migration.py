@@ -1,24 +1,36 @@
-"""Migration trigger and WebSocket log streaming endpoints."""
+"""Migration trigger, run details, and WebSocket log streaming endpoints."""
 
 from __future__ import annotations
 
-import asyncio
-import json
-
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tsql_migration.api.database import get_db
 from tsql_migration.api.log_streamer import get_broadcaster
-from tsql_migration.api.models import Project, ProjectResponse, ProjectStatus
+from tsql_migration.api.models import (
+    LogResponse,
+    MigrationLog,
+    MigrationRun,
+    MigrationStage,
+    PIPELINE_STAGES,
+    Project,
+    ProjectResponse,
+    ProjectStatus,
+    RunDetailResponse,
+    RunResponse,
+    RunStatus,
+    StageResponse,
+    StageStatus,
+)
 from tsql_migration.api.runner import start_migration
 
 router = APIRouter(prefix="/api/projects", tags=["migration"])
 
 
-@router.post("/{project_id}/migrate", response_model=ProjectResponse)
+@router.post("/{project_id}/migrate", response_model=RunResponse)
 async def trigger_migration(project_id: int, db: AsyncSession = Depends(get_db)):
-    """Start the migration pipeline for a project."""
+    """Start a new migration run for a project."""
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -29,43 +41,100 @@ async def trigger_migration(project_id: int, db: AsyncSession = Depends(get_db))
     if project.file_count == 0:
         raise HTTPException(status_code=400, detail="No SQL files uploaded")
 
-    # Reset stages to pending for re-runs
-    from sqlalchemy import select
-    from tsql_migration.api.models import MigrationStage, StageStatus
-
+    # Determine run number
     result = await db.execute(
-        select(MigrationStage).where(MigrationStage.project_id == project_id)
+        select(func.coalesce(func.max(MigrationRun.run_number), 0))
+        .where(MigrationRun.project_id == project_id)
     )
-    for stage in result.scalars().all():
-        stage.status = StageStatus.PENDING
-        stage.started_at = None
-        stage.completed_at = None
-        stage.error_message = None
+    max_run = result.scalar()
+    run_number = max_run + 1
+
+    # Create run
+    run = MigrationRun(
+        project_id=project_id,
+        run_number=run_number,
+        status=RunStatus.RUNNING,
+    )
+    db.add(run)
+    await db.flush()
+
+    # Create stage records for this run
+    for order, (stage_name, _) in enumerate(PIPELINE_STAGES):
+        stage = MigrationStage(
+            run_id=run.id,
+            stage_name=stage_name,
+            stage_order=order,
+            status=StageStatus.PENDING,
+        )
+        db.add(stage)
 
     project.status = ProjectStatus.MIGRATING
     project.error_message = None
     await db.commit()
-    await db.refresh(project)
+    await db.refresh(run)
 
     # Launch pipeline in background
-    await start_migration(project_id)
+    await start_migration(project_id, run.id)
 
-    return project
+    return run
 
 
-@router.websocket("/{project_id}/ws")
-async def migration_logs_ws(websocket: WebSocket, project_id: int):
-    """WebSocket endpoint that streams real-time migration logs."""
+@router.get("/{project_id}/runs/{run_id}", response_model=RunDetailResponse)
+async def get_run(project_id: int, run_id: int, db: AsyncSession = Depends(get_db)):
+    """Get a specific run with its stages."""
+    run = await db.get(MigrationRun, run_id)
+    if not run or run.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    result = await db.execute(
+        select(MigrationStage)
+        .where(MigrationStage.run_id == run_id)
+        .order_by(MigrationStage.stage_order)
+    )
+    stages = result.scalars().all()
+
+    return RunDetailResponse(
+        run=RunResponse.model_validate(run),
+        stages=[StageResponse.model_validate(s) for s in stages],
+    )
+
+
+@router.get("/{project_id}/runs/{run_id}/logs", response_model=list[LogResponse])
+async def get_run_logs(
+    project_id: int,
+    run_id: int,
+    stage: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get persisted logs for a run. Optionally filter by stage."""
+    run = await db.get(MigrationRun, run_id)
+    if not run or run.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    query = (
+        select(MigrationLog)
+        .where(MigrationLog.run_id == run_id)
+        .order_by(MigrationLog.id)
+    )
+    if stage:
+        query = query.where(MigrationLog.stage == stage)
+
+    result = await db.execute(query)
+    return [LogResponse.model_validate(log) for log in result.scalars().all()]
+
+
+@router.websocket("/{project_id}/runs/{run_id}/ws")
+async def migration_logs_ws(websocket: WebSocket, project_id: int, run_id: int):
+    """WebSocket endpoint that streams real-time migration logs for a run."""
     await websocket.accept()
 
-    broadcaster = get_broadcaster(project_id)
+    broadcaster = get_broadcaster(run_id)
     sub_id, queue = broadcaster.subscribe()
 
     try:
         while True:
             entry = await queue.get()
             if entry is None:
-                # End of stream
                 await websocket.send_json({
                     "type": "complete",
                     "stage": "pipeline",

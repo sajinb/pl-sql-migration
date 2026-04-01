@@ -11,20 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tsql_migration.api.database import get_db
 from tsql_migration.api.models import (
+    MigrationLog,
+    MigrationRun,
     MigrationStage,
-    PIPELINE_STAGES,
     Project,
     ProjectCreate,
     ProjectDetailResponse,
     ProjectResponse,
     ProjectStatus,
-    StageResponse,
-    StageStatus,
+    RunResponse,
 )
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
-# Base directory for uploaded SQL files
 UPLOAD_BASE = Path("projects")
 
 
@@ -47,16 +46,6 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
     project.sql_input_dir = str(sql_dir)
     project.output_dir = str(output_dir)
 
-    # Create pipeline stage records
-    for order, (stage_name, _) in enumerate(PIPELINE_STAGES):
-        stage = MigrationStage(
-            project_id=project.id,
-            stage_name=stage_name,
-            stage_order=order,
-            status=StageStatus.PENDING,
-        )
-        db.add(stage)
-
     await db.commit()
     await db.refresh(project)
     return project
@@ -71,27 +60,27 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
 async def get_project(project_id: int, db: AsyncSession = Depends(get_db)):
-    """Get project with stage details."""
+    """Get project with all runs."""
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     result = await db.execute(
-        select(MigrationStage)
-        .where(MigrationStage.project_id == project_id)
-        .order_by(MigrationStage.stage_order)
+        select(MigrationRun)
+        .where(MigrationRun.project_id == project_id)
+        .order_by(MigrationRun.run_number.desc())
     )
-    stages = result.scalars().all()
+    runs = result.scalars().all()
 
     return ProjectDetailResponse(
         project=ProjectResponse.model_validate(project),
-        stages=[StageResponse.model_validate(s) for s in stages],
+        runs=[RunResponse.model_validate(r) for r in runs],
     )
 
 
 @router.delete("/{project_id}", status_code=204)
 async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
-    """Delete a project and its files."""
+    """Delete a project and all its runs, stages, logs, and files."""
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -104,12 +93,24 @@ async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
     if project_dir.exists():
         shutil.rmtree(project_dir)
 
-    # Delete stages
-    result = await db.execute(
-        select(MigrationStage).where(MigrationStage.project_id == project_id)
+    # Cascade delete: logs -> stages -> runs -> project
+    runs_result = await db.execute(
+        select(MigrationRun).where(MigrationRun.project_id == project_id)
     )
-    for stage in result.scalars().all():
-        await db.delete(stage)
+    for run in runs_result.scalars().all():
+        # Delete logs for this run
+        logs_result = await db.execute(
+            select(MigrationLog).where(MigrationLog.run_id == run.id)
+        )
+        for log in logs_result.scalars().all():
+            await db.delete(log)
+        # Delete stages for this run
+        stages_result = await db.execute(
+            select(MigrationStage).where(MigrationStage.run_id == run.id)
+        )
+        for stage in stages_result.scalars().all():
+            await db.delete(stage)
+        await db.delete(run)
 
     await db.delete(project)
     await db.commit()
@@ -132,18 +133,15 @@ async def upload_files(
     sql_dir = Path(project.sql_input_dir)
     sql_dir.mkdir(parents=True, exist_ok=True)
 
-    count = 0
     for file in files:
         if not file.filename:
             continue
-        # Preserve subdirectory structure from filename (e.g. "procedures/foo.sql")
         filename = Path(file.filename).name
         if not filename.lower().endswith(".sql"):
             continue
         dest = sql_dir / filename
         content = await file.read()
         dest.write_bytes(content)
-        count += 1
 
     project.file_count = len(list(sql_dir.glob("*.sql")))
     project.status = ProjectStatus.READY if project.file_count > 0 else ProjectStatus.CREATED

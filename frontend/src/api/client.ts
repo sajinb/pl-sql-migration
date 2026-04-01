@@ -1,5 +1,12 @@
 import axios from "axios";
-import type { Project, ProjectDetail, FileInfo } from "../types";
+import type {
+  Project,
+  ProjectDetail,
+  RunDetail,
+  MigrationRun,
+  FileInfo,
+  PersistedLog,
+} from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8001";
 
@@ -42,12 +49,42 @@ export async function listFiles(projectId: number): Promise<FileInfo[]> {
   return data;
 }
 
-export async function triggerMigration(projectId: number): Promise<Project> {
+export async function triggerMigration(
+  projectId: number
+): Promise<MigrationRun> {
   const { data } = await api.post(`/api/projects/${projectId}/migrate`);
   return data;
 }
 
-export function createMigrationWebSocket(projectId: number): WebSocket {
+export async function getRun(
+  projectId: number,
+  runId: number
+): Promise<RunDetail> {
+  const { data } = await api.get(
+    `/api/projects/${projectId}/runs/${runId}`
+  );
+  return data;
+}
+
+export async function getRunLogs(
+  projectId: number,
+  runId: number,
+  stage?: string
+): Promise<PersistedLog[]> {
+  const params = stage ? { stage } : {};
+  const { data } = await api.get(
+    `/api/projects/${projectId}/runs/${runId}/logs`,
+    { params }
+  );
+  return data;
+}
+
+export function createRunWebSocket(
+  projectId: number,
+  runId: number
+): WebSocket {
   const wsBase = API_BASE.replace(/^http/, "ws");
-  return new WebSocket(`${wsBase}/api/projects/${projectId}/ws`);
+  return new WebSocket(
+    `${wsBase}/api/projects/${projectId}/runs/${runId}/ws`
+  );
 }

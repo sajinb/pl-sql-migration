@@ -6,6 +6,8 @@ export type ProjectStatus =
   | "completed"
   | "failed";
 
+export type RunStatus = "running" | "completed" | "failed";
+
 export type StageStatus =
   | "pending"
   | "running"
@@ -24,9 +26,22 @@ export interface Project {
   updated_at: string;
 }
 
-export interface Stage {
+export interface MigrationRun {
   id: number;
   project_id: number;
+  run_number: number;
+  status: RunStatus;
+  error_message: string | null;
+  procedures_migrated: number;
+  procedures_failed: number;
+  files_generated: number;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface Stage {
+  id: number;
+  run_id: number;
   stage_name: string;
   stage_order: number;
   status: StageStatus;
@@ -37,6 +52,11 @@ export interface Stage {
 
 export interface ProjectDetail {
   project: Project;
+  runs: MigrationRun[];
+}
+
+export interface RunDetail {
+  run: MigrationRun;
   stages: Stage[];
 }
 
@@ -44,6 +64,15 @@ export interface FileInfo {
   name: string;
   size: number;
   lines: number;
+}
+
+export interface PersistedLog {
+  id: number;
+  run_id: number;
+  stage: string;
+  level: "info" | "warning" | "error";
+  message: string;
+  created_at: string;
 }
 
 export interface LogMessage {
