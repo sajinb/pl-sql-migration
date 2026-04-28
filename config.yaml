@@ -33,6 +33,9 @@ migration:
   use_jdbc_template: false
   generate_tests: true
 
+  # Validation
+  validate_llm_review: false   # set to true to send generated code back to LLM for review
+
   # LangGraph
   checkpointer: "sqlite"
   checkpoint_db: ".migration_checkpoints.db"

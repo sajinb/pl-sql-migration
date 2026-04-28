@@ -80,6 +80,22 @@ def generate_node(state: MigrationState) -> dict:
         edge_path.write_text(json.dumps(edge_report, indent=2))
         output_files.append(str(edge_path))
 
+    # --- Validation report ---
+    if state.validation_results:
+        val_report = {
+            proc: {
+                "service_name": r.service_name,
+                "passed": r.passed,
+                "todo_count": r.todo_count,
+                "issues": [i.model_dump() for i in r.issues],
+                **({"llm_review": r.llm_review} if r.llm_review else {}),
+            }
+            for proc, r in state.validation_results.items()
+        }
+        val_path = output_dir / "validation_report.json"
+        val_path.write_text(json.dumps(val_report, indent=2))
+        output_files.append(str(val_path))
+
     print(f"[GENERATE] Wrote {len(output_files)} files to {output_dir}/")
     for f in output_files:
         print(f"  {f}")
@@ -110,6 +126,12 @@ def _build_report(state: MigrationState) -> dict:
             for name, m in state.migrated_procedures.items()
         },
         "failed_procedures": state.failed_procedures,
+        "validation": {
+            "total": len(state.validation_results),
+            "passed": sum(1 for r in state.validation_results.values() if r.passed),
+            "failed": sum(1 for r in state.validation_results.values() if not r.passed),
+            "total_todos": sum(r.todo_count for r in state.validation_results.values()),
+        },
     }
 
 

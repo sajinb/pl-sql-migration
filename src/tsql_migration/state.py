@@ -124,6 +124,25 @@ class EntityMetadata(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Validation models (output of VALIDATE node)
+# ---------------------------------------------------------------------------
+
+class ValidationIssue(BaseModel):
+    severity: str   # "error" | "warning" | "info"
+    code: str       # e.g. "MISSING_SERVICE_ANNOTATION", "UNBALANCED_BRACES"
+    message: str
+
+
+class ValidationResult(BaseModel):
+    procedure_name: str
+    service_name: str
+    passed: bool          # True if no errors (warnings are allowed)
+    issues: list[ValidationIssue] = []
+    todo_count: int = 0   # number of // TODO markers left by the LLM
+    llm_review: str = ""  # raw LLM review text when validate_llm_review is enabled
+
+
+# ---------------------------------------------------------------------------
 # Migrated procedure (output of MIGRATE node)
 # ---------------------------------------------------------------------------
 
@@ -173,6 +192,9 @@ class MigrationState(BaseModel):
     migrated_procedures: dict[str, MigratedProcedure] = {}
     current_procedure: Optional[str] = None
     failed_procedures: dict[str, str] = {}
+
+    # After VALIDATE
+    validation_results: dict[str, ValidationResult] = {}
 
     # After GENERATE
     output_files: list[str] = []

@@ -11,6 +11,7 @@ from tsql_migration.pipeline.nodes.plan_node import plan_node
 from tsql_migration.pipeline.nodes.extract_schema_node import extract_schema_node
 from tsql_migration.pipeline.nodes.prepare_node import prepare_node
 from tsql_migration.pipeline.nodes.migrate_node import migrate_node
+from tsql_migration.pipeline.nodes.validate_node import validate_node
 from tsql_migration.pipeline.nodes.generate_node import generate_node
 
 
@@ -18,7 +19,7 @@ def build_pipeline() -> StateGraph:
     """Build the LangGraph migration pipeline.
 
     Flow:
-        PARSE → ANALYZE → PLAN → EXTRACT_SCHEMA → PREPARE → MIGRATE → GENERATE
+        PARSE → ANALYZE → PLAN → EXTRACT_SCHEMA → PREPARE → MIGRATE → VALIDATE → GENERATE
     """
     workflow = StateGraph(MigrationState)
 
@@ -29,6 +30,7 @@ def build_pipeline() -> StateGraph:
     workflow.add_node("extract_schema", extract_schema_node)
     workflow.add_node("prepare", prepare_node)
     workflow.add_node("migrate", migrate_node)
+    workflow.add_node("validate", validate_node)
     workflow.add_node("generate", generate_node)
 
     # Define edges — linear pipeline
@@ -38,7 +40,8 @@ def build_pipeline() -> StateGraph:
     workflow.add_edge("plan", "extract_schema")
     workflow.add_edge("extract_schema", "prepare")
     workflow.add_edge("prepare", "migrate")
-    workflow.add_edge("migrate", "generate")
+    workflow.add_edge("migrate", "validate")
+    workflow.add_edge("validate", "generate")
     workflow.add_edge("generate", END)
 
     return workflow

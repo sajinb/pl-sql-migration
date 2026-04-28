@@ -44,6 +44,9 @@ class MigrationConfig(BaseModel):
     use_jdbc_template: bool = False
     generate_tests: bool = True
 
+    # Validation
+    validate_llm_review: bool = False  # send generated code back to LLM for review (slower, uses tokens)
+
     # LangGraph
     checkpointer: str = "sqlite"
     checkpoint_db: str = ".migration_checkpoints.db"
