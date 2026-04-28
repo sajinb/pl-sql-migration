@@ -35,8 +35,8 @@ AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server (same tabl
                          LangGraph Pipeline
   +----------+  +----------+  +--------+  +---------+  +---------+
   |  PARSE   |->| ANALYZE  |->|  PLAN  |->| EXTRACT |->| PREPARE |
-  | (sqlglot)|  | (Neo4j)  |  |(topo-  |  | SCHEMA  |  |(staging |
-  |          |  |          |  | sort)  |  |(entities)|  | DDL)    |
+  | (sqlglot)|  | (Neo4j / |  |(topo-  |  | SCHEMA  |  |(staging |
+  |          |  | Ladybug) |  | sort)  |  |(entities)|  | DDL)    |
   +----------+  +----------+  +--------+  +---------+  +----+----+
                                                              |
                                                              v
@@ -56,6 +56,13 @@ AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server (same tabl
                                               +-------------+-------------+
                                                             v
                                                       +-----------+
+                                                      | VALIDATE  |
+                                                      |(structural|
+                                                      |+ LLM opt) |
+                                                      +-----+-----+
+                                                            |
+                                                            v
+                                                      +-----------+
                                                       | GENERATE  |
                                                       |(Java, DDL,|
                                                       | reports)  |
@@ -67,12 +74,13 @@ AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server (same tabl
 | # | Node | Input | Output |
 |---|------|-------|--------|
 | 1 | **PARSE** | `.sql` files | `ProcedureMetadata` per procedure (params, temp tables, called procs, tables, logical blocks) |
-| 2 | **ANALYZE** | Parsed metadata | Call graph in Neo4j + `EdgeCaseReport` (linked servers, dynamic SQL, variable calls) |
-| 3 | **PLAN** | Neo4j call graph | Migration order (bottom-up: leaf procedures first) |
+| 2 | **ANALYZE** | Parsed metadata | Call graph in Neo4j/LadybugDB + `EdgeCaseReport` (linked servers, dynamic SQL, variable calls) |
+| 3 | **PLAN** | Call graph | Migration order (bottom-up: leaf procedures first) |
 | 4 | **EXTRACT SCHEMA** | Referenced table names | JPA `@Entity` classes + `JpaRepository` interfaces (from live DB or DDL scripts) |
 | 5 | **PREPARE** | Temp table metadata | Staging table DDLs with `batch_id` isolation |
 | 6 | **MIGRATE** | Procedures in order | Java `@Service` code via LLM (single call or chunked for large procedures) |
-| 7 | **GENERATE** | All migrated code | Output files: entities, repositories, services, DDLs, reports |
+| 7 | **VALIDATE** | Generated service code | `ValidationResult` per procedure — structural checks + optional LLM review |
+| 8 | **GENERATE** | All migrated + validated code | Output files: entities, repositories, services, DDLs, reports |
 
 ## Key Design Decisions
 
@@ -148,7 +156,21 @@ migration:
   large_procedure_threshold: 2000
   staging_table_prefix: "stg_"
   base_package: "com.migration.generated"
+  validate_llm_review: false    # send generated code back to LLM for review (slower)
 ```
+
+#### Graph Database: Neo4j or LadybugDB
+
+The call graph can be stored in **Neo4j** (default, requires a running server) or **LadybugDB** (embedded, no server — stores in a local directory).
+
+| | Neo4j | LadybugDB |
+|---|---|---|
+| Setup | Separate server process | `pip install real-ladybug`, no server |
+| Storage | Remote (bolt://) | Local directory (`.ladybug_db/`) |
+| Isolation | Database/label prefix | Per-project directory |
+| Query language | Cypher | openCypher (same syntax) |
+
+LadybugDB support is implemented in `graph/ladybug_client.py` and can be wired in as a drop-in replacement for the Neo4j client.
 
 #### Neo4j Database Isolation
 
@@ -220,8 +242,9 @@ output/
   cleanup/
     StagingTableCleanupService.java
     BatchIdGenerator.java
-  migration_report.json      # Summary of migration results
+  migration_report.json      # Summary of migration results + validation pass/fail counts
   edge_case_report.json      # Linked servers, dynamic SQL, unresolved calls
+  validation_report.json     # Per-procedure validation issues and TODO marker counts
 ```
 
 ## Sample Procedures
@@ -272,6 +295,7 @@ src/tsql_migration/
     entity_generator.py            # JPA @Entity + JpaRepository generation
   graph/
     neo4j_client.py                # Neo4j operations and Cypher queries
+    ladybug_client.py              # LadybugDB embedded alternative (drop-in replacement)
   chunker/
     sql_chunker.py                 # SQL-aware text splitting
   pipeline/
@@ -283,7 +307,8 @@ src/tsql_migration/
       extract_schema_node.py       # Node 4: Generate entities from DB/DDL
       prepare_node.py              # Node 5: Generate staging table DDLs
       migrate_node.py              # Node 6: LLM-powered code migration
-      generate_node.py             # Node 7: Write output files
+      validate_node.py             # Node 7: Structural + optional LLM review of generated Java
+      generate_node.py             # Node 8: Write output files
     prompts/
       system_prompt.py             # LLM system and user prompts
       chunk_prompt.py              # Edge case prompt fragments
