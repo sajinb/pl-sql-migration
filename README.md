@@ -1,32 +1,33 @@
-# T-SQL to Spring Boot 3 Migration Tool
+# SQL to Spring Boot 3 Migration Tool
 
-AI-powered agentic workflow that migrates T-SQL (SQL Server) stored procedures to Spring Boot 3 / Java 21 services.
+AI-powered agentic workflow that migrates **T-SQL (SQL Server)** and **Oracle PL/SQL** stored procedures to Spring Boot 3 / Java 21 services.
 
-Built with **Python**, using **sqlglot** for T-SQL parsing, **LangGraph** for pipeline orchestration, **LangChain** for LLM calls, and **Neo4j** for call graph analysis.
+Built with **Python**, using **sqlglot** for SQL parsing, **LangGraph** for pipeline orchestration, **LangChain** for LLM calls, and **Neo4j** for call graph analysis.
 
 ## Migration Scope
 
 ```
-BEFORE:  Application --> SQL Server (tables + stored procedures)
-AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server (same tables)
+BEFORE:  Application --> SQL Server / Oracle  (tables + stored procedures)
+AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server / Oracle (same tables)
 ```
 
 | Artifact | Migrated? | Details |
 |---|---|---|
-| **Tables** | No | Stay in SQL Server, no DDL changes |
+| **Tables** | No | Stay in the source database, no DDL changes |
 | **Stored Procedures** | Yes | Business logic moves to Java `@Service` classes |
-| **Temp Tables** | Yes | Replaced with `stg_` staging tables in same DB |
+| **Temp Tables / GTTs** | Yes | T-SQL `#temp` and Oracle GTTs → `stg_` staging tables with `batch_id` isolation |
+| **PL/SQL Packages** | Yes | Each procedure/function in a package body is unwrapped and migrated individually |
 | **Table Access** | Yes | JPA `@Entity` + `JpaRepository` generated for all referenced tables |
 
 ## Tech Stack
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| T-SQL Parsing | `sqlglot` (TSQL dialect) | Parse procedures into AST, extract metadata |
+| SQL Parsing | `sqlglot` (TSQL + Oracle dialects) | Parse procedures/packages into AST, extract metadata |
 | Orchestration | `langgraph` | Deterministic stateful DAG pipeline |
 | LLM Calls | `langchain-anthropic` / `langchain-openai` | Code generation via Claude or GPT |
 | Chunking | `langchain-text-splitters` | Split large procedures (2000+ lines) for LLM context |
-| Call Graph | `neo4j` | Store/query procedure dependencies, topological sort |
+| Call Graph | `neo4j` (or LadybugDB embedded) | Store/query procedure dependencies, topological sort |
 | Data Models | `pydantic` | Type-safe state for LangGraph nodes |
 
 ## Architecture
@@ -84,13 +85,17 @@ AFTER:   Application --> Spring Boot 3 (Java services) --> SQL Server (same tabl
 
 ## Key Design Decisions
 
-### 1. Temp Tables -> Staging Tables (NOT In-Memory)
+### 1. Temp Tables / GTTs -> Staging Tables (NOT In-Memory)
 
-Temp table data is **not** held in Java memory. Each `#TempTable` becomes a real staging table with a `batch_id` column for concurrent execution isolation. Cleanup happens in a `finally` block + a scheduled hourly safety net.
+Temp table data is **not** held in Java memory. Each `#TempTable` (T-SQL) or Global Temporary Table (Oracle) becomes a real staging table with a `batch_id` column for concurrent execution isolation. Cleanup happens in a `finally` block + a scheduled hourly safety net.
 
 ```
 T-SQL:   CREATE TABLE #ProcessingLog (...)
          INSERT INTO #ProcessingLog ...
+
+Oracle:  CREATE GLOBAL TEMPORARY TABLE gtt_processing_log (...) ON COMMIT DELETE ROWS;
+         INSERT INTO gtt_processing_log ...
+
 Java:    String batchId = UUID.randomUUID().toString();
          jdbcTemplate.update("INSERT INTO stg_processing_log (batch_id, ...) VALUES (?, ...)", batchId, ...);
          ... finally { cleanupService.cleanupBatch(batchId); }
@@ -98,7 +103,7 @@ Java:    String batchId = UUID.randomUUID().toString();
 
 ### 2. Call Graph -> Neo4j (Bottom-Up Migration)
 
-Procedures are migrated **after** their dependencies. When `sp_ProcessOrder` calls `sp_CalculateOrderTotal`, the latter is migrated first, and its Java service name is injected into the LLM prompt for the caller.
+Procedures are migrated **after** their dependencies. When `sp_ProcessOrder` calls `sp_CalculateOrderTotal`, the latter is migrated first, and its Java service name is injected into the LLM prompt for the caller. The same applies to Oracle package-qualified calls (`pkg.proc_name`).
 
 ```
 sp_GetCustomerDetails      (leaf, migrated 1st)
@@ -107,24 +112,35 @@ sp_ProcessOrder            (calls both, migrated 3rd)
 sp_GenerateMonthlyReport   (calls ProcessOrder, migrated 4th)
 ```
 
-### 3. Large Procedure Chunking (LLM Context Window)
+### 3. Oracle Package Body Unwrapping
 
-Procedures exceeding a configurable threshold (default: 2000 lines) are split using SQL-aware separators (`BEGIN TRY`, `DECLARE`, `CREATE TABLE #`, etc.). Each chunk carries variable context and prior generated output to the next LLM call. This enables **LLM portability** across providers with different context limits.
+Oracle procedures often live inside package bodies. The parser unwraps each `PROCEDURE` and `FUNCTION` within a package body into its own `ProcedureMetadata`, named `<package>.<procedure>`. A state machine tracks `BEGIN`/`END` nesting (ignoring `END IF`, `END LOOP`, `END CASE`) to correctly identify procedure boundaries.
 
-### 4. Three Tough Scenarios
+```
+CREATE OR REPLACE PACKAGE BODY pkg_orders AS
+    PROCEDURE get_order(...)  →  ProcedureMetadata("pkg_orders.get_order")
+    FUNCTION  calc_total(...) →  ProcedureMetadata("pkg_orders.calc_total")
+END pkg_orders;
+```
 
-| Scenario | Detection | Handling |
-|---|---|---|
-| **Linked Servers** (4-part names) | Regex on `[Server].[DB].[Schema].[Object]` | Catalog in Neo4j as `(:LinkedServer)`, flag for human decision |
-| **Dynamic SQL** (`EXEC(@sql)`) | 4-tier classification: simple, templated, concatenated, opaque | Simple/templated -> `JdbcTemplate`; concatenated -> query builder; opaque -> `// TODO` |
-| **Variable Calls** (`EXEC @var`) | Backward variable tracing | Resolved -> direct call; conditional -> switch; dispatch table -> strategy pattern; opaque -> `// TODO` |
+### 4. Large Procedure Chunking (LLM Context Window)
+
+Procedures exceeding a configurable threshold (default: 2000 lines) are split using dialect-aware separators. T-SQL uses `BEGIN TRY`, `DECLARE`, `CREATE TABLE #`, etc. Oracle uses `EXCEPTION`, `EXECUTE IMMEDIATE`, `END LOOP`, `END IF`, etc. Each chunk carries variable context and prior generated output to the next LLM call.
+
+### 5. Tough Scenarios — T-SQL vs Oracle
+
+| Scenario | T-SQL | Oracle | Handling |
+|---|---|---|---|
+| **Remote object access** | Linked servers (`[Server].[DB].[Schema].[Obj]`) | Database links (`table@link_name`) | Catalog in graph, `// TODO: LINKED_SERVER` / `DATABASE_LINK`, placeholder method |
+| **Dynamic SQL** | `EXEC(@sql)` / `sp_executesql` | `EXECUTE IMMEDIATE` / `DBMS_SQL` | 4-tier: simple → `JdbcTemplate`; templated → parameterized; concatenated → query builder; opaque → `// TODO` |
+| **Dynamic dispatch** | `EXEC @var` | `EXECUTE IMMEDIATE 'BEGIN ' \|\| v_proc \|\| '(); END;'` | Backward variable tracing: resolved → direct call; conditional → switch; dispatch table → strategy pattern; opaque → `// TODO` |
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.12+
-- Neo4j Community Edition (running on `bolt://localhost:7687`)
+- Neo4j Community Edition (running on `bolt://localhost:7687`) — or use LadybugDB (embedded, no server)
 - Anthropic API key (or OpenAI)
 
 ### Install
@@ -145,6 +161,7 @@ Edit `config.yaml` or use CLI flags:
 
 ```yaml
 migration:
+  sql_dialect: "tsql"             # "tsql" for SQL Server | "oracle" for Oracle PL/SQL
   sql_input_dir: "sql-input/procedures"
   ddl_input_dir: "sql-input/ddl"
   output_dir: "output"
@@ -158,6 +175,13 @@ migration:
   base_package: "com.migration.generated"
   validate_llm_review: false    # send generated code back to LLM for review (slower)
 ```
+
+For Oracle, also set:
+```yaml
+migration:
+  sql_dialect: "oracle"
+```
+Oracle `.pkb` (package body) and `.prc` files are parsed in addition to `.sql`.
 
 #### Graph Database: Neo4j or LadybugDB
 
@@ -261,7 +285,9 @@ The `sql-input/procedures/` directory includes 5 sample procedures:
 
 Table DDLs are in `sql-input/ddl/tables.sql` (11 tables).
 
-## T-SQL to Java Mapping
+## SQL to Java Mapping
+
+### T-SQL
 
 | T-SQL | Spring Boot 3 / Java 21 |
 |---|---|
@@ -279,6 +305,33 @@ Table DDLs are in `sql-input/ddl/tables.sql` (11 tables).
 | `ISNULL(a, b)` | `Objects.requireNonNullElse(a, b)` |
 | `@@ROWCOUNT` | `jdbcTemplate.update()` return value |
 
+### Oracle PL/SQL
+
+| Oracle PL/SQL | Spring Boot 3 / Java 21 |
+|---|---|
+| `CREATE OR REPLACE PROCEDURE` | `@Service` class with method |
+| `CREATE OR REPLACE PACKAGE BODY` | One `@Service` per procedure/function (unwrapped) |
+| `p_param IN NUMBER` | `int param` / `long param` / `BigDecimal param` |
+| `p_param OUT VARCHAR2` | Return as record/DTO field |
+| `p_param IN OUT type` | Input parameter + returned in result record |
+| `GLOBAL TEMPORARY TABLE` / `TYPE t IS TABLE OF` | Staging table with `batch_id` + cleanup |
+| `pkg_name.proc_name(args)` | `injectedService.methodName(args)` |
+| `FOR rec IN cursor LOOP` | `jdbcTemplate.query()` + iteration |
+| `SYS_REFCURSOR OUT` | `List<Map<String,Object>>` via `queryForList()` |
+| `EXCEPTION WHEN NO_DATA_FOUND` | `catch (EmptyResultDataAccessException e)` |
+| `EXCEPTION WHEN OTHERS` | `catch (Exception e)` |
+| `RAISE_APPLICATION_ERROR` | `throw new RuntimeException(msg)` |
+| `COMMIT` (implicit) | `@Transactional` |
+| `EXECUTE IMMEDIATE 'sql'` | `jdbcTemplate.execute()` / `queryForObject()` |
+| `EXECUTE IMMEDIATE v_sql USING b1, b2` | Parameterized `JdbcTemplate` query |
+| `DBMS_OUTPUT.PUT_LINE(msg)` | `log.info(msg)` |
+| `SYSDATE` | `LocalDate.now()` |
+| `NVL(a, b)` | `Objects.requireNonNullElse(a, b)` |
+| `DECODE(expr, v, r, def)` | `switch` expression / ternary |
+| `SQL%ROWCOUNT` | `jdbcTemplate.update()` return value |
+| `\|\|` (string concat) | `+` in Java |
+| `%ROWTYPE` | Generated Java record/DTO |
+
 ## Project Structure
 
 ```
@@ -288,7 +341,9 @@ src/tsql_migration/
   state.py                         # Pydantic state models
   parser/
     tsql_parser.py                 # sqlglot-based T-SQL parser
-    edge_case_detector.py          # Linked servers, dynamic SQL, variable calls
+    edge_case_detector.py          # T-SQL: linked servers, dynamic SQL, variable calls
+    oracle_parser.py               # Oracle PL/SQL parser + package body unwrapper
+    oracle_edge_case_detector.py   # Oracle: database links, EXECUTE IMMEDIATE, dynamic dispatch
   schema/
     schema_extractor.py            # Live DB schema via INFORMATION_SCHEMA
     ddl_parser.py                  # Offline DDL parsing via sqlglot
@@ -310,8 +365,9 @@ src/tsql_migration/
       validate_node.py             # Node 7: Structural + optional LLM review of generated Java
       generate_node.py             # Node 8: Write output files
     prompts/
-      system_prompt.py             # LLM system and user prompts
-      chunk_prompt.py              # Edge case prompt fragments
+      system_prompt.py             # T-SQL LLM system and user prompts
+      chunk_prompt.py              # T-SQL edge case prompt fragments
+      oracle_system_prompt.py      # Oracle LLM system prompt + edge case context builder
   output/
     java_writer.py                 # Java file writing utility
 ```
