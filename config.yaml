@@ -33,6 +33,9 @@ migration:
   use_jdbc_template: false
   generate_tests: true
 
+  # Dialect
+  sql_dialect: "tsql"          # "tsql" for SQL Server stored procedures | "oracle" for Oracle PL/SQL
+
   # Validation
   validate_llm_review: false   # set to true to send generated code back to LLM for review
 

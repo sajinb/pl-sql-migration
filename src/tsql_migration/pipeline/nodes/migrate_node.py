@@ -11,19 +11,30 @@ import re
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from tsql_migration.chunker.sql_chunker import SqlChunker
-from tsql_migration.pipeline.prompts.chunk_prompt import build_edge_case_context
-from tsql_migration.pipeline.prompts.system_prompt import (
-    SYSTEM_PROMPT,
-    build_migration_prompt,
-)
 from tsql_migration.state import MigratedProcedure, MigrationState
 
 
 def migrate_node(state: MigrationState) -> dict:
     """Migrate all procedures in migration order."""
     config = state.config
+    dialect = config.sql_dialect
+
+    # Select prompts and edge-case context builder based on dialect
+    if dialect == "oracle":
+        from tsql_migration.pipeline.prompts.oracle_system_prompt import (
+            ORACLE_SYSTEM_PROMPT as SYSTEM_PROMPT,
+            build_oracle_migration_prompt as build_migration_prompt,
+            build_oracle_edge_case_context as build_edge_case_context,
+        )
+    else:
+        from tsql_migration.pipeline.prompts.system_prompt import (
+            SYSTEM_PROMPT,
+            build_migration_prompt,
+        )
+        from tsql_migration.pipeline.prompts.chunk_prompt import build_edge_case_context
+
     llm = _create_llm(config)
-    chunker = SqlChunker(config.chunk_size_tokens, config.chunk_overlap_tokens)
+    chunker = SqlChunker(config.chunk_size_tokens, config.chunk_overlap_tokens, dialect=dialect)
 
     migrated: dict[str, MigratedProcedure] = dict(state.migrated_procedures)
     failed: dict[str, str] = dict(state.failed_procedures)

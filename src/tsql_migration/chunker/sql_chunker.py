@@ -1,8 +1,10 @@
 """SQL-aware text splitting for large stored procedures.
 
-Uses LangChain's RecursiveCharacterTextSplitter with T-SQL-specific
+Uses LangChain's RecursiveCharacterTextSplitter with dialect-specific
 separators to split large procedures into chunks that respect SQL
 block boundaries.
+
+Supported dialects: "tsql" (default), "oracle"
 """
 
 from __future__ import annotations
@@ -11,9 +13,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from tsql_migration.state import ProcedureMetadata, SqlBlock
 
-# SQL-aware separators in order of priority.
-# We split at the highest-priority boundary we can.
-SQL_SEPARATORS = [
+# ---------------------------------------------------------------------------
+# T-SQL separators
+# ---------------------------------------------------------------------------
+TSQL_SEPARATORS = [
     "\nBEGIN TRY",
     "\nBEGIN CATCH",
     "\nEND TRY",
@@ -39,23 +42,68 @@ SQL_SEPARATORS = [
     "\n",
 ]
 
+# Keep old name as alias so any external references still work
+SQL_SEPARATORS = TSQL_SEPARATORS
+
+# ---------------------------------------------------------------------------
+# Oracle PL/SQL separators
+# ---------------------------------------------------------------------------
+ORACLE_SEPARATORS = [
+    "\nEXCEPTION",
+    "\nWHEN ",
+    "\nEXECUTE IMMEDIATE",
+    "\nBEGIN",
+    "\nEND;",
+    "\nEND LOOP;",
+    "\nEND IF;",
+    "\nEND CASE;",
+    "\nFOR ",
+    "\nWHILE ",
+    "\nLOOP",
+    "\nIF ",
+    "\nELSIF ",
+    "\nELSE",
+    "\nINSERT ",
+    "\nUPDATE ",
+    "\nDELETE ",
+    "\nMERGE ",
+    "\nSELECT ",
+    "\nOPEN ",
+    "\nFETCH ",
+    "\nCLOSE ",
+    "\nRETURN ",
+    ";\n",
+    "\n\n",
+    "\n",
+]
+
 # Approximate chars per token for estimation
 CHARS_PER_TOKEN = 4
 
 
 class SqlChunker:
-    """Splits large T-SQL procedures into LLM-friendly chunks."""
+    """Splits large stored procedures into LLM-friendly chunks.
+
+    Args:
+        chunk_size_tokens:   Maximum tokens per chunk (default 8000).
+        chunk_overlap_tokens: Overlap between adjacent chunks (default 500).
+        dialect:             ``"tsql"`` (default) or ``"oracle"``.
+    """
 
     def __init__(
         self,
         chunk_size_tokens: int = 8000,
         chunk_overlap_tokens: int = 500,
+        dialect: str = "tsql",
     ) -> None:
         self.chunk_size_chars = chunk_size_tokens * CHARS_PER_TOKEN
         self.chunk_overlap_chars = chunk_overlap_tokens * CHARS_PER_TOKEN
+        self.dialect = dialect
+
+        separators = ORACLE_SEPARATORS if dialect == "oracle" else TSQL_SEPARATORS
 
         self._splitter = RecursiveCharacterTextSplitter(
-            separators=SQL_SEPARATORS,
+            separators=separators,
             chunk_size=self.chunk_size_chars,
             chunk_overlap=self.chunk_overlap_chars,
             length_function=len,
@@ -63,7 +111,7 @@ class SqlChunker:
         )
 
     def needs_chunking(self, procedure: ProcedureMetadata, threshold: int = 2000) -> bool:
-        """Check if a procedure exceeds the size threshold for chunking."""
+        """Return True if *procedure* exceeds *threshold* lines."""
         return procedure.total_line_count > threshold
 
     def chunk(self, procedure: ProcedureMetadata) -> list[ProcedureChunk]:

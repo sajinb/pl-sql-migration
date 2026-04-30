@@ -15,7 +15,14 @@ from tsql_migration.state import ColumnMetadata, EntityMetadata, ForeignKeyMetad
 
 
 class DdlParser:
-    """Parse CREATE TABLE statements from .sql files using sqlglot."""
+    """Parse CREATE TABLE statements from .sql files using sqlglot.
+
+    Args:
+        dialect: sqlglot dialect to use — ``"tsql"`` (default) or ``"oracle"``.
+    """
+
+    def __init__(self, dialect: str = "tsql") -> None:
+        self.dialect = dialect
 
     def parse_directory(self, ddl_dir: Path) -> dict[str, EntityMetadata]:
         """Parse all .sql files in the DDL directory."""
@@ -30,7 +37,7 @@ class DdlParser:
         """Parse SQL containing one or more CREATE TABLE statements."""
         entities: dict[str, EntityMetadata] = {}
 
-        for statement in sqlglot.parse(sql, dialect="tsql", error_level=sqlglot.ErrorLevel.IGNORE):
+        for statement in sqlglot.parse(sql, dialect=self.dialect, error_level=sqlglot.ErrorLevel.IGNORE):
             if statement is None:
                 continue
             if not isinstance(statement, exp.Create):
@@ -101,7 +108,7 @@ class DdlParser:
         """Extract the SQL type string from a column definition."""
         kind = col_def.find(exp.DataType)
         if kind:
-            return kind.sql(dialect="tsql")
+            return kind.sql(dialect=self.dialect)
         return "VARCHAR"
 
     def _has_not_null(self, col_def: exp.ColumnDef) -> bool:
@@ -109,16 +116,19 @@ class DdlParser:
 
     def _has_identity(self, col_def: exp.ColumnDef) -> bool:
         """Check if column has IDENTITY property."""
-        sql_text = col_def.sql(dialect="tsql").upper()
+        sql_text = col_def.sql(dialect=self.dialect).upper()
         return "IDENTITY" in sql_text
 
     def _has_primary_key(self, col_def: exp.ColumnDef) -> bool:
         """Check if column has inline PRIMARY KEY constraint."""
-        sql_text = col_def.sql(dialect="tsql").upper()
+        sql_text = col_def.sql(dialect=self.dialect).upper()
         return "PRIMARY KEY" in sql_text
 
     def _find_pk_constraints(self, sql: str, table_name: str) -> list[str]:
-        """Find table-level PRIMARY KEY constraint columns via regex."""
+        """Find table-level PRIMARY KEY constraint columns via regex.
+
+        Handles both T-SQL [bracket] and Oracle "quoted" identifier styles.
+        """
         import re
 
         pattern = re.compile(
@@ -127,25 +137,31 @@ class DdlParser:
         columns: list[str] = []
         for match in pattern.finditer(sql):
             for col in match.group(1).split(","):
-                col = col.strip().strip("[]").split()[0]  # remove ASC/DESC
+                col = col.strip().strip("[]\"").split()[0]  # remove ASC/DESC, brackets, quotes
                 columns.append(col)
         return columns
 
     def _find_fk_constraints(self, sql: str, table_name: str) -> list[ForeignKeyMetadata]:
-        """Find FOREIGN KEY constraints via regex."""
+        """Find FOREIGN KEY constraints via regex.
+
+        Handles both T-SQL [bracket] and Oracle "quoted" identifier styles.
+        """
         import re
 
+        # Matches [name], "name", or bare name
+        ident = r'[\["]?(\w+)[\]"]?'
         pattern = re.compile(
-            r"(?i)FOREIGN\s+KEY\s*\(\s*\[?(\w+)\]?\s*\)\s*REFERENCES\s+"
-            r"(?:\[?\w+\]?\.)?\[?(\w+)\]?\s*\(\s*\[?(\w+)\]?\s*\)",
+            rf'(?i)FOREIGN\s+KEY\s*\(\s*{ident}\s*\)\s*REFERENCES\s+'
+            rf'(?:{ident}\.)?\s*{ident}\s*\(\s*{ident}\s*\)',
         )
         fks: list[ForeignKeyMetadata] = []
         for match in pattern.finditer(sql):
+            # Groups: col, optional_schema, ref_table, ref_col
             fks.append(
                 ForeignKeyMetadata(
                     column=match.group(1),
-                    referenced_table=match.group(2),
-                    referenced_column=match.group(3),
+                    referenced_table=match.group(3),
+                    referenced_column=match.group(4),
                 )
             )
         return fks

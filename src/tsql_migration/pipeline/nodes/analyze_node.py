@@ -5,13 +5,23 @@ from __future__ import annotations
 import os
 
 from tsql_migration.graph.neo4j_client import Neo4jClient
-from tsql_migration.parser.edge_case_detector import EdgeCaseDetector
 from tsql_migration.state import MigrationState
 
 
 def analyze_node(state: MigrationState) -> dict:
-    """Build the call graph in Neo4j and detect edge cases."""
+    """Build the call graph in Neo4j and detect edge cases.
+
+    Routes to OracleEdgeCaseDetector or EdgeCaseDetector based on
+    ``config.sql_dialect``.
+    """
     config = state.config
+
+    if config.sql_dialect == "oracle":
+        from tsql_migration.parser.oracle_edge_case_detector import OracleEdgeCaseDetector
+        detector = OracleEdgeCaseDetector()
+    else:
+        from tsql_migration.parser.edge_case_detector import EdgeCaseDetector
+        detector = EdgeCaseDetector()
 
     neo4j_password = os.environ.get(config.neo4j_password_env, "neo4j")
     client = Neo4jClient(
@@ -32,7 +42,6 @@ def analyze_node(state: MigrationState) -> dict:
             client.add_procedure(proc)
 
         # Detect edge cases
-        detector = EdgeCaseDetector()
         edge_case_report = detector.detect_all(state.procedures)
 
         # Add edge cases to Neo4j
@@ -44,7 +53,7 @@ def analyze_node(state: MigrationState) -> dict:
         # Find external dependencies
         external_deps = client.get_external_dependencies()
 
-        print(f"[ANALYZE] Call graph built in Neo4j:")
+        print(f"[ANALYZE] Dialect={config.sql_dialect} — call graph built in Neo4j:")
         print(f"  Procedures: {len(state.procedures)}")
         print(f"  Cycles detected: {len(cycles)}")
         print(f"  External dependencies: {external_deps}")

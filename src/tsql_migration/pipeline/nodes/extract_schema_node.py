@@ -43,7 +43,7 @@ def extract_schema_node(state: MigrationState) -> dict:
     if not entities:
         ddl_dir = Path(config.ddl_input_dir)
         if ddl_dir.exists() and any(ddl_dir.glob("*.sql")):
-            parser = DdlParser()
+            parser = DdlParser(dialect=config.sql_dialect)
             all_ddl_entities = parser.parse_directory(ddl_dir)
             # Filter to only referenced tables
             entities = {
